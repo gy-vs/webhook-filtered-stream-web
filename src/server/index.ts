@@ -4,6 +4,54 @@ import {fileURLToPath} from 'node:url';
 
 const BUFFER_CAPACITY = 100;
 const WORKSPACE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+const MAX_FILTER_PATH_LENGTH = 256;
+
+// Observation scope for one snapshot/stream request. Filters are a server-side
+// view over the same workspace log: capture keeps recording every event and the
+// (epoch, seq) identity stays workspace-wide; only delivery is restricted.
+export type EventFilter = {
+  path: string | null; // exact path match, null = every path
+  verification: 'all' | 'valid' | 'invalid';
+};
+
+export const EMPTY_FILTER: EventFilter = {path: null, verification: 'all'};
+
+export function isFiltered(filter: EventFilter) {
+  return filter.path !== null || filter.verification !== 'all';
+}
+
+export function eventMatches(
+  filter: EventFilter,
+  event: {path: string; valid: boolean},
+) {
+  if (filter.path !== null && event.path !== filter.path) return false;
+  if (filter.verification === 'valid' && !event.valid) return false;
+  if (filter.verification === 'invalid' && event.valid) return false;
+  return true;
+}
+
+/** Parse the path/verification query params. Returns 'invalid' for malformed input. */
+export function parseEventFilter(query: unknown): EventFilter | 'invalid' {
+  const q = (query ?? {}) as Record<string, unknown>;
+  if (Array.isArray(q.path) || Array.isArray(q.verification)) return 'invalid';
+
+  let path: string | null = null;
+  if (q.path !== undefined) {
+    if (typeof q.path !== 'string') return 'invalid';
+    const trimmed = q.path.trim();
+    if (trimmed.length > MAX_FILTER_PATH_LENGTH || /[\x00-\x1f\x7f]/.test(trimmed)) {
+      return 'invalid';
+    }
+    if (trimmed.length > 0) path = trimmed.startsWith('/') ? trimmed : '/' + trimmed;
+  }
+
+  let verification: EventFilter['verification'] = 'all';
+  if (q.verification !== undefined) {
+    if (q.verification !== 'valid' && q.verification !== 'invalid') return 'invalid';
+    verification = q.verification;
+  }
+  return {path, verification};
+}
 
 export type EventRow = {
   epoch: string;
@@ -40,20 +88,38 @@ function sseFrame(payload: unknown, options: {event?: string; id?: string} = {})
   return idLine + eventLine + 'data: ' + body + '\n\n';
 }
 
+type Listener = {
+  res: express.Response;
+  filter: EventFilter;
+};
+
+// Compact record of events that left the replay buffer: just enough to decide
+// whether a filtered resume skipped an in-scope event or merely out-of-scope
+// ones. Bounded identically to the event buffer, so once a record ages out of
+// the ledger we honestly report the range as indeterminate rather than
+// guessing "no gap" or "gap".
+type EvictedRecord = {
+  seq: number;
+  path: string;
+  valid: boolean;
+};
+
 class WorkspaceLog {
   readonly epoch: string;
   private readonly capacity: number;
   private buffer: EventRow[] = [];
   private nextSeq = 1;
   private highWaterSeq = 0;
-  private listeners = new Set<express.Response>();
+  private listeners = new Set<Listener>();
+  private evicted: EvictedRecord[] = [];
+
   constructor(epoch: string, capacity: number) {
     this.epoch = epoch;
     this.capacity = capacity;
   }
 
-  snapshot() {
-    return this.buffer.slice();
+  snapshot(filter: EventFilter = EMPTY_FILTER) {
+    return isFiltered(filter) ? this.buffer.filter(event => eventMatches(filter, {path: event.path, valid: event.verification.valid})) : this.buffer.slice();
   }
 
   get size() {
@@ -64,9 +130,17 @@ class WorkspaceLog {
     const event: EventRow = {...partial, epoch: this.epoch, seq: this.nextSeq++};
     this.highWaterSeq = event.seq;
     this.buffer.push(event);
-    while (this.buffer.length > this.capacity) this.buffer.shift();
+    while (this.buffer.length > this.capacity) {
+      const dropped = this.buffer.shift()!;
+      this.evicted.push({seq: dropped.seq, path: dropped.path, valid: dropped.verification.valid});
+      while (this.evicted.length > this.capacity) this.evicted.shift();
+    }
     const frame = this.eventFrame(event);
-    for (const listener of this.listeners) listener.write(frame);
+    for (const listener of this.listeners) {
+      if (eventMatches(listener.filter, {path: event.path, valid: event.verification.valid})) {
+        listener.res.write(frame);
+      }
+    }
     return event;
   }
 
@@ -75,15 +149,81 @@ class WorkspaceLog {
     return sseFrame(event, {id: event.epoch + ':' + event.seq});
   }
 
+  /**
+   * Decide what happened in (cursor, firstSeq) given that firstSeq-1 is the
+   * highest seq no longer reachable from the buffer. Returns null when nothing
+   * in scope is missing. When the eviction ledger no longer covers the whole
+   * range and it contains no in-scope record, the result is indeterminate:
+   * out-of-scope skips cannot then be distinguished from a lost in-scope one.
+   */
+  private evictionGap(args: {
+    cursor: number;
+    firstSeq: number;
+    oldestReachable: number | null;
+    filter: EventFilter;
+  }): GapPayload | null {
+    const {cursor, firstSeq, oldestReachable, filter} = args;
+    if (cursor >= firstSeq - 1) return null;
+
+    const evictedInRange = this.evicted.filter(record => record.seq > cursor && record.seq < firstSeq);
+    const covered =
+      evictedInRange.length > 0 &&
+      evictedInRange[0].seq === cursor + 1 &&
+      evictedInRange[evictedInRange.length - 1].seq === firstSeq - 1;
+    const matched = evictedInRange.filter(record => eventMatches(filter, record));
+
+    if (matched.length === 0) {
+      // With the whole evicted range on record and none in scope, those seqs
+      // were filtered out by design: continuity holds for this observation.
+      if (covered) return null;
+      return this.gapPayload(cursor, oldestReachable, true, filter);
+    }
+    return this.gapPayload(cursor, oldestReachable, false, filter);
+  }
+
+  private gapPayload(
+    lastSeen: number,
+    oldest: number | null,
+    indeterminate: boolean,
+    filter: EventFilter,
+  ): GapPayload {
+    const scope = this.describeFilter(filter);
+    const oldestText = oldest == null ? '' : `（#${oldest} 起仍可补发）`;
+    const message = indeterminate
+      ? `事件 #${lastSeen} 之后的记录已超出重放缓冲区，且无法确定其中是否存在${scope}的请求${oldestText}。`
+      : `事件 #${lastSeen} 之后${scope}的记录已超出重放缓冲区，无法补发${oldestText}。`;
+    return {
+      kind: 'gap',
+      epoch: this.epoch,
+      fromEpoch: this.epoch,
+      lastSeen,
+      oldest,
+      reason: 'buffer-overflow',
+      message,
+    };
+  }
+
+  private describeFilter(filter: EventFilter) {
+    if (!isFiltered(filter)) return '';
+    const parts: string[] = [];
+    if (filter.path !== null) parts.push(`路径 ${filter.path}`);
+    if (filter.verification === 'invalid') parts.push('校验失败');
+    if (filter.verification === 'valid') parts.push('校验通过');
+    return parts.join('、');
+  }
+
   /** Register the listener first, then flush replay frames, so nothing can slip in between. */
-  attach(res: express.Response, cursor: Cursor | null) {
-    this.listeners.add(res);
-    res.on('close', () => this.listeners.delete(res));
-    res.on('error', () => this.listeners.delete(res));
+  attach(res: express.Response, cursor: Cursor | null, filter: EventFilter = EMPTY_FILTER) {
+    const listener: Listener = {res, filter};
+    this.listeners.add(listener);
+    res.on('close', () => this.listeners.delete(listener));
+    res.on('error', () => this.listeners.delete(listener));
 
     let gap: GapPayload | null = null;
     if (!cursor) {
-      for (const event of this.buffer) res.write(this.eventFrame(event));
+      for (const event of this.buffer) {
+        if (eventMatches(filter, {path: event.path, valid: event.verification.valid})) res.write(this.eventFrame(event));
+      }
     } else if (cursor.epoch !== this.epoch) {
       gap = {
         kind: 'gap',
@@ -96,35 +236,25 @@ class WorkspaceLog {
       };
       // Replay everything buffered in the new epoch; same seq numbers under a
       // different epoch are different events and must all be delivered.
-      for (const event of this.buffer) res.write(this.eventFrame(event));
+      for (const event of this.buffer) {
+        if (eventMatches(filter, {path: event.path, valid: event.verification.valid})) res.write(this.eventFrame(event));
+      }
     } else if (this.buffer.length === 0) {
       // Nothing is buffered. Without a high-water mark nothing was ever lost;
-      // if events past the cursor were published and evicted, that is a gap.
+      // if events past the cursor were published and evicted, the ledger tells
+      // whether any of them belonged to this observation scope.
       if (cursor.seq < this.highWaterSeq) {
-        gap = {
-          kind: 'gap',
-          epoch: this.epoch,
-          fromEpoch: cursor.epoch,
-          lastSeen: cursor.seq,
-          oldest: null,
-          reason: 'buffer-overflow',
-          message: `事件 #${cursor.seq} 之后的记录已超出重放缓冲区，断线期间的事件丢失。`,
-        };
+        gap = this.evictionGap({
+          cursor: cursor.seq,
+          firstSeq: this.highWaterSeq + 1,
+          oldestReachable: null,
+          filter,
+        });
       }
     } else {
       const oldest = this.buffer[0].seq;
       const newest = this.buffer[this.buffer.length - 1].seq;
-      if (cursor.seq < oldest - 1) {
-        gap = {
-          kind: 'gap',
-          epoch: this.epoch,
-          fromEpoch: cursor.epoch,
-          lastSeen: cursor.seq,
-          oldest,
-          reason: 'buffer-overflow',
-          message: `事件 #${cursor.seq} 之后、#${oldest} 之前的记录已超出重放缓冲区，无法补发。`,
-        };
-      } else if (cursor.seq > newest) {
+      if (cursor.seq > newest) {
         gap = {
           kind: 'gap',
           epoch: this.epoch,
@@ -134,10 +264,26 @@ class WorkspaceLog {
           reason: 'ahead-of-buffer',
           message: `Last-Event-ID #${cursor.seq} 领先于服务端缓冲（最新 #${newest}）。`,
         };
+      } else {
+        // Gap detection runs over this scope's own replay position: the cursor
+        // is the last *delivered* (in-scope) event, and evicted out-of-scope
+        // seqs are continuity, not loss. The displayed oldest points at the
+        // first in-scope event the client is actually about to receive.
+        const firstReplay = this.buffer.find(
+          event => event.seq > cursor.seq && eventMatches(filter, {path: event.path, valid: event.verification.valid}),
+        );
+        gap = this.evictionGap({
+          cursor: cursor.seq,
+          firstSeq: oldest,
+          oldestReachable: firstReplay?.seq ?? null,
+          filter,
+        });
       }
-      // Replay only events strictly after the cursor; an overflow gap is still
-      // followed by the part of the buffer that survives.
-      for (const event of this.buffer) if (event.seq > cursor.seq) res.write(this.eventFrame(event));
+      // Replay only in-scope events strictly after the cursor; an overflow gap
+      // is still followed by the part of the buffer that survives.
+      for (const event of this.buffer) {
+        if (event.seq > cursor.seq && eventMatches(filter, {path: event.path, valid: event.verification.valid})) res.write(this.eventFrame(event));
+      }
     }
     if (gap) res.write(sseFrame(gap, {event: 'gap'}));
     res.write(sseFrame({epoch: this.epoch, capacity: this.capacity, buffered: this.buffer.length}, {event: 'ready'}));
@@ -195,7 +341,12 @@ export function createApp(options: {epoch?: string; bufferCapacity?: number} = {
       res.status(400).json({error: 'invalid workspace'});
       return;
     }
-    res.json({epoch, events: getWorkspace(name).snapshot()});
+    const filter = parseEventFilter(req.query);
+    if (filter === 'invalid') {
+      res.status(400).json({error: 'invalid filter'});
+      return;
+    }
+    res.json({epoch, events: getWorkspace(name).snapshot(filter)});
   });
 
   app.post('/api/capture/:workspace/*path', (req, res) => {
@@ -210,6 +361,11 @@ export function createApp(options: {epoch?: string; bufferCapacity?: number} = {
   });
 
   app.get('/api/stream/:workspace', (req, res) => {
+    const filter = parseEventFilter(req.query);
+    if (filter === 'invalid') {
+      res.status(400).json({error: 'invalid filter'});
+      return;
+    }
     const log = getWorkspace(req.workspace!);
     const cursor = parseCursor(req.header('last-event-id'));
     res.set({
@@ -219,7 +375,7 @@ export function createApp(options: {epoch?: string; bufferCapacity?: number} = {
       'x-epoch': epoch,
     });
     res.flushHeaders?.();
-    log.attach(res, cursor);
+    log.attach(res, cursor, filter);
   });
 
   app.post('/api/replay', async (req, res) => {

@@ -1,4 +1,5 @@
 import type {ConnectionState, EventRow, GapNotice} from './eventLog';
+import type {EventFilter} from './filter';
 
 export type StreamHandlers = {
   // live is false for frames replayed during the (re)connection handshake;
@@ -10,18 +11,38 @@ export type StreamHandlers = {
 };
 
 /**
+ * Encode an observation scope as the stream query string. The browser's
+ * EventSource reuses this exact URL on every automatic reconnect, so a resume
+ * always continues under the same filter; the Last-Event-ID it echoes is the
+ * last id delivered within that scope, never a cursor borrowed from another.
+ */
+export function streamQuery(filter: EventFilter): string {
+  const params = new URLSearchParams();
+  if (filter.path !== null) params.set('path', filter.path);
+  if (filter.verification !== 'all') params.set('verification', filter.verification);
+  const query = params.toString();
+  return query ? '?' + query : '';
+}
+
+/**
  * Open (and own) exactly one EventSource for one workspace.
  *
- * The returned close function always closes the source, so workspace switches
- * and React StrictMode remounts tear down the old connection immediately
- * instead of stacking two sources that would double-deliver every event.
+ * The returned close function always closes the source, so workspace switches,
+ * filter changes and React StrictMode remounts tear down the old connection
+ * immediately instead of stacking two sources that would double-deliver.
  *
  * EventSource performs its own automatic reconnect (re-sending Last-Event-ID);
  * we never recreate the source on error, which is what prevents duplicate
  * connections after transient network drops.
  */
-export function openWorkspaceStream(workspace: string, handlers: StreamHandlers) {
-  const source = new EventSource('/api/stream/' + encodeURIComponent(workspace));
+export function openWorkspaceStream(
+  workspace: string,
+  handlers: StreamHandlers,
+  filter: EventFilter = {path: null, verification: 'all'},
+) {
+  const source = new EventSource(
+    '/api/stream/' + encodeURIComponent(workspace) + streamQuery(filter),
+  );
   let closed = false;
   // Frames received before the first "ready" frame of this connection are the
   // server's replay buffer, not new live events.

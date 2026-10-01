@@ -1,5 +1,5 @@
 import {useEffect, useMemo, useRef, useState} from 'react';
-import {Radio, RotateCcw, AlertTriangle, Plus} from 'lucide-react';
+import {Radio, RotateCcw, AlertTriangle, Plus, X} from 'lucide-react';
 import {
   applyEvent,
   applyGap,
@@ -15,18 +15,29 @@ import {
   type GapNotice,
 } from './eventLog';
 import {openWorkspaceStream} from './stream';
+import {
+  EMPTY_FILTER,
+  describeFilter,
+  filterQueryString,
+  filtersEqual,
+  isFiltered,
+  normalizePath,
+  type EventFilter,
+} from './filter';
 
 type WorkspaceView = {
   log: EventLogState;
   status: ConnectionState;
   selected: string | null;
   unread: number;
+  // Observation scope for this workspace only; other workspaces keep theirs.
+  filter: EventFilter;
 };
 
 const DEFAULT_WORKSPACES = ['default', 'payments'];
 
 function freshView(): WorkspaceView {
-  return {log: emptyLog(), status: 'connecting', selected: null, unread: 0};
+  return {log: emptyLog(), status: 'connecting', selected: null, unread: 0, filter: EMPTY_FILTER};
 }
 
 function gapLabel(gap: GapNotice) {
@@ -39,15 +50,21 @@ export default function App() {
   const [workspaces, setWorkspaces] = useState<string[]>(DEFAULT_WORKSPACES);
   const [workspace, setWorkspace] = useState('default');
   const [newWorkspace, setNewWorkspace] = useState('');
+  const [pathDraft, setPathDraft] = useState('');
   const [views, setViews] = useState<Record<string, WorkspaceView>>(() => ({
     default: freshView(),
     payments: freshView(),
   }));
   const workspaceRef = useRef(workspace);
   workspaceRef.current = workspace;
+  // Scope of the connection whose callbacks are currently allowed to land.
+  // Keyed by workspace + filter so stale frames from an old condition cannot
+  // merge into the new list.
+  const scopeKeyRef = useRef('default|');
   const documentVisibleRef = useRef(typeof document === 'undefined' || document.visibilityState !== 'hidden');
 
   const view = views[workspace] ?? freshView();
+  const filter = view.filter;
 
   const patchView = (name: string, patch: (current: WorkspaceView) => WorkspaceView) => {
     setViews(prev => {
@@ -58,55 +75,79 @@ export default function App() {
     });
   };
 
-  // Snapshot + exactly one EventSource per active workspace.
-  // Re-runs (including StrictMode remounts and workspace switches) close the
-  // previous source first, so no connection is ever left dangling.
+  const scopeKey = (name: string, scope: EventFilter) => name + '|' + filterQueryString(scope);
+
+  // Snapshot + exactly one EventSource per active (workspace, filter) scope.
+  // Re-runs (StrictMode remounts, workspace switches, filter changes) close the
+  // previous source first and reset the observed log, so the snapshot and the
+  // stream always belong to the same condition and no connection is dangling.
   useEffect(() => {
+    const scope = scopeKey(workspace, filter);
+    scopeKeyRef.current = scope;
     let cancelled = false;
-    fetch('/api/events?workspace=' + encodeURIComponent(workspace))
+    const query = filterQueryString(filter);
+    fetch('/api/events?workspace=' + encodeURIComponent(workspace) + (query ? '&' + query : ''))
       .then(response => (response.ok ? response.json() : null))
       .then(payload => {
-        if (cancelled || !payload) return;
+        if (cancelled || scopeKeyRef.current !== scope || !payload) return;
         const events: EventRow[] = Array.isArray(payload.events) ? payload.events : [];
-        patchView(workspace, current => ({...current, log: applySnapshot(current.log, events)}));
+        patchView(workspace, current =>
+          filtersEqual(current.filter, filter)
+            ? {...current, log: applySnapshot(current.log, events)}
+            : current,
+        );
       })
       .catch(() => {
         /* stream reconnect covers snapshot failures */
       });
 
-    const close = openWorkspaceStream(workspace, {
-      onEvent: (event, live) => {
-        patchView(workspaceRef.current, current => {
-          const before = current.log.rows.length;
-          const log = applyEvent(current.log, event);
-          if (log === current.log || log.rows.length === before) return current;
-          // Only genuinely live events arriving while the tab is hidden are
-          // unread; replayed frames (initial load / reconnect) never are.
-          const unread = live && !documentVisibleRef.current ? current.unread + 1 : current.unread;
-          return {...current, log, unread};
-        });
+    const close = openWorkspaceStream(
+      workspace,
+      {
+        onEvent: (event, live) => {
+          patchView(workspaceRef.current, current => {
+            if (scopeKeyRef.current !== scope || !filtersEqual(current.filter, filter)) return current;
+            const before = current.log.rows.length;
+            const log = applyEvent(current.log, event);
+            if (log === current.log || log.rows.length === before) return current;
+            // Only genuinely live events arriving while the tab is hidden are
+            // unread; replayed frames (initial load / reconnect) never are.
+            const unread = live && !documentVisibleRef.current ? current.unread + 1 : current.unread;
+            return {...current, log, unread};
+          });
+        },
+        onGap: gap => {
+          patchView(workspaceRef.current, current => {
+            if (scopeKeyRef.current !== scope || !filtersEqual(current.filter, filter)) return current;
+            return {...current, log: applyGap(current.log, gap)};
+          });
+        },
+        onReady: () => {
+          /* status already flips to open via source.onopen */
+        },
+        onStateChange: status => {
+          patchView(workspaceRef.current, current =>
+            scopeKeyRef.current === scope && filtersEqual(current.filter, filter) && current.status !== status
+              ? {...current, status}
+              : current,
+          );
+        },
       },
-      onGap: gap => {
-        patchView(workspaceRef.current, current => ({
-          ...current,
-          log: applyGap(current.log, gap),
-        }));
-      },
-      onReady: () => {
-        /* status already flips to open via source.onopen */
-      },
-      onStateChange: status => {
-        patchView(workspaceRef.current, current =>
-          current.status === status ? current : {...current, status},
-        );
-      },
-    });
+      filter,
+    );
 
     return () => {
       cancelled = true;
       close();
     };
-  }, [workspace]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace, filter.path, filter.verification]);
+
+  // Keep the path input in sync when the workspace or its committed filter changes.
+  useEffect(() => {
+    setPathDraft(filter.path ?? '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace, filter.path]);
 
   // Reset unread when the tab becomes visible (per workspace).
   useEffect(() => {
@@ -131,7 +172,10 @@ export default function App() {
 
   function switchWorkspace(next: string) {
     if (next === workspace) return;
+    const nextView = views[next];
+    scopeKeyRef.current = scopeKey(next, nextView?.filter ?? EMPTY_FILTER);
     setWorkspace(next);
+    setPathDraft(nextView?.filter.path ?? '');
     setViews(prev => {
       const current = prev[next];
       if (!current || current.unread === 0) return prev;
@@ -151,6 +195,43 @@ export default function App() {
     switchWorkspace(name);
   }
 
+  /**
+   * Change this workspace's observation scope. The log, gaps and selection are
+   * cleared synchronously and the scope guard advances before the old source's
+   * teardown, so late frames delivered under the old condition can neither
+   * interleave into the new list nor leave the detail pointing at a row the
+   * new scope does not contain. Unread state belongs to the workspace and is
+   * intentionally kept; other workspaces are untouched.
+   */
+  function commitFilter(next: EventFilter) {
+    if (filtersEqual(filter, next)) return;
+    scopeKeyRef.current = scopeKey(workspace, next);
+    patchView(workspace, current => ({
+      ...current,
+      filter: next,
+      log: emptyLog(),
+      selected: null,
+      status: 'connecting',
+    }));
+  }
+
+  function submitPath(raw: string) {
+    commitFilter({...filter, path: normalizePath(raw)});
+  }
+
+  function setVerification(verification: EventFilter['verification']) {
+    commitFilter({...filter, verification});
+  }
+
+  function clearFilter() {
+    setPathDraft('');
+    commitFilter(EMPTY_FILTER);
+  }
+
+  const knownPaths = useMemo(
+    () => Array.from(new Set(view.log.rows.map(row => row.path))).sort(),
+    [view.log.rows],
+  );
   const rowsDescending = useMemo(() => view.log.rows.slice().reverse(), [view.log.rows]);
   const {banners, inline} = useMemo(() => gapsForRender(view.log), [view.log]);
   const inlineByBoundary = useMemo(() => {
@@ -218,6 +299,41 @@ export default function App() {
             事件
             <small className="epoch">epoch: {active?.epoch.slice(0, 8) ?? '—'}</small>
           </h2>
+          <div className="filters">
+            <input
+              className="filter-path"
+              list="known-paths"
+              value={pathDraft}
+              onChange={event => setPathDraft(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter') submitPath(pathDraft);
+              }}
+              onBlur={() => submitPath(pathDraft)}
+              placeholder="按路径筛选，如 /orders"
+              aria-label="按请求路径筛选"
+            />
+            <datalist id="known-paths">
+              {knownPaths.map(path => (
+                <option key={path} value={path} />
+              ))}
+            </datalist>
+            <select
+              className="filter-verif"
+              value={filter.verification}
+              onChange={event => setVerification(event.target.value as EventFilter['verification'])}
+              aria-label="按验证结果筛选"
+            >
+              <option value="all">全部校验</option>
+              <option value="invalid">校验失败</option>
+              <option value="valid">校验通过</option>
+            </select>
+            {isFiltered(filter) && (
+              <button className="filter-clear" onClick={clearFilter} title="清除筛选">
+                <X size={14} />
+              </button>
+            )}
+          </div>
+          {isFiltered(filter) && <p className="filter-scope">观察范围：{describeFilter(filter)}</p>}
           {banners.map(gap => (
             <div className="gap-banner" key={'banner-' + gapKey(gap)}>
               <AlertTriangle size={15} />
@@ -256,7 +372,11 @@ export default function App() {
               )),
             ])}
             {view.log.rows.length === 0 && banners.length === 0 && (
-              <p className="empty">等待 {workspace} 工作区的 webhook…</p>
+              <p className="empty">
+                {isFiltered(filter)
+                  ? `等待 ${workspace} 工作区中 ${describeFilter(filter)} 的 webhook…`
+                  : `等待 ${workspace} 工作区的 webhook…`}
+              </p>
             )}
           </div>
         </aside>

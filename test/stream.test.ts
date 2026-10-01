@@ -1,5 +1,6 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
-import {openWorkspaceStream, type StreamHandlers} from '../src/client/stream';
+import {openWorkspaceStream, streamQuery, type StreamHandlers} from '../src/client/stream';
+import type {EventFilter} from '../src/client/filter';
 
 type Listener = (event: {data: string}) => void;
 
@@ -86,8 +87,21 @@ describe('workspace stream lifecycle', () => {
     close2();
   });
 
-  it('never leaves two live sources when switching workspaces', () => {
-    const closeDefault = openWorkspaceStream('default', silentHandlers());
+  it('encodes the observation scope into the URL so reconnect resumes that scope', () => {
+    const filter: EventFilter = {path: '/payments', verification: 'invalid'};
+    expect(streamQuery({path: null, verification: 'all'})).toBe('');
+    const close = openWorkspaceStream('default', silentHandlers(), filter);
+    const url = new URL(MockEventSource.lastUrl ?? '', 'http://x');
+    expect(url.pathname).toBe('/api/stream/default');
+    expect(url.searchParams.get('path')).toBe('/payments');
+    expect(url.searchParams.get('verification')).toBe('invalid');
+    // The EventSource URL (and therefore Last-Event-ID resume) is fixed for the
+    // source's lifetime; changing filters opens a new source, handled by App.
+    expect(MockEventSource.instances[0].url).toContain('path=%2Fpayments');
+    close();
+  });
+
+  it('never leaves two live sources when switching workspaces', () => {    const closeDefault = openWorkspaceStream('default', silentHandlers());
     closeDefault();
     const closePayments = openWorkspaceStream('payments', silentHandlers());
     expect(MockEventSource.lastUrl).toBe('/api/stream/payments');
