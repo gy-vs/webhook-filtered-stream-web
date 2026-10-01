@@ -1,4 +1,5 @@
 import type {ConnectionState, EventRow, GapNotice} from './eventLog';
+import {filterQuery, type Filter} from '../shared/filter';
 
 export type StreamHandlers = {
   // live is false for frames replayed during the (re)connection handshake;
@@ -10,18 +11,24 @@ export type StreamHandlers = {
 };
 
 /**
- * Open (and own) exactly one EventSource for one workspace.
+ * Open (and own) exactly one EventSource for one workspace observation scope.
  *
- * The returned close function always closes the source, so workspace switches
- * and React StrictMode remounts tear down the old connection immediately
- * instead of stacking two sources that would double-deliver every event.
+ * The filter is part of the URL, so the browser's automatic reconnect (which
+ * re-sends Last-Event-ID) resumes the *same* scope; it can never borrow another
+ * scope's cursor. Changing the condition closes this source and opens a new one.
  *
- * EventSource performs its own automatic reconnect (re-sending Last-Event-ID);
- * we never recreate the source on error, which is what prevents duplicate
- * connections after transient network drops.
+ * The returned close function always closes the source, so workspace/filter
+ * switches and React StrictMode remounts tear down the old connection
+ * immediately instead of stacking two sources that would double-deliver events.
  */
-export function openWorkspaceStream(workspace: string, handlers: StreamHandlers) {
-  const source = new EventSource('/api/stream/' + encodeURIComponent(workspace));
+export function openWorkspaceStream(
+  workspace: string,
+  handlers: StreamHandlers,
+  filter: Filter = {},
+) {
+  const source = new EventSource(
+    '/api/stream/' + encodeURIComponent(workspace) + filterQuery(filter),
+  );
   let closed = false;
   // Frames received before the first "ready" frame of this connection are the
   // server's replay buffer, not new live events.

@@ -40,6 +40,15 @@ h2 .epoch { font-weight: 400; font-size: 11px; color: #7a8881; font-family: ui-m
 .gap-divider { display: flex; align-items: center; gap: 6px; margin: 2px 0; padding: 4px 8px; border: 1px dashed #d8a06a; border-radius: 6px; color: #9a5f28; background: #fdf7f0; font-size: 11px; }
 .gap-divider svg { flex: none; }
 .empty { color: #7a8881; font-size: 13px; padding: 8px 2px; }
+.filters { display: flex; align-items: center; gap: 6px; margin: 4px 0 8px; }
+.filters-icon { flex: none; color: #5f7a71; }
+.filter-path { flex: 1 1 auto; min-width: 0; height: 30px; padding: 0 9px; border: 1px solid #c4cec8; border-radius: 6px; color: #27332e; background: #fbfcfb; font-size: 12px; outline: none; }
+.filter-path:focus { border-color: #83aa9e; box-shadow: 0 0 0 2px rgba(23,107,85,.12); }
+.filter-verif { flex: none; height: 30px; padding: 0 4px; border: 1px solid #c4cec8; border-radius: 6px; color: #27332e; background: #fbfcfb; font-size: 12px; outline: none; }
+.filter-clear { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 1px solid #c4cec8; border-radius: 6px; color: #5f7a71; background: #fbfcfb; }
+.filter-clear:hover { background: #edf2ef; color: #173c35; }
+.scope-hint { margin: 0 0 8px; padding: 7px 9px; border: 1px solid #bcd8cf; border-radius: 6px; background: #eef6f2; color: #2c5447; font-size: 12px; line-height: 1.5; }
+.scope-hint small { color: #517064; }
 .list { display: grid; gap: 6px; }
 .list button { width: 100%; min-height: 42px; padding: 9px 10px; text-align: left; border: 1px solid transparent; border-radius: 6px; color: #27332e; background: transparent; }
 .list button:hover { background: #edf2ef; }

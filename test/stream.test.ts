@@ -86,6 +86,23 @@ describe('workspace stream lifecycle', () => {
     close2();
   });
 
+  it('encodes the observation scope into the URL so reconnect resumes the same condition', () => {
+    const close = openWorkspaceStream('payments', silentHandlers(), {
+      path: '/orders',
+      verification: 'invalid',
+    });
+    const url = new URL(MockEventSource.lastUrl!, 'http://x');
+    expect(url.pathname).toBe('/api/stream/payments');
+    expect(url.searchParams.get('path')).toBe('/orders');
+    expect(url.searchParams.get('verification')).toBe('invalid');
+    close();
+
+    // No condition at all stays exactly the legacy URL.
+    const closeAll = openWorkspaceStream('default', silentHandlers());
+    expect(MockEventSource.lastUrl).toBe('/api/stream/default');
+    closeAll();
+  });
+
   it('never leaves two live sources when switching workspaces', () => {
     const closeDefault = openWorkspaceStream('default', silentHandlers());
     closeDefault();

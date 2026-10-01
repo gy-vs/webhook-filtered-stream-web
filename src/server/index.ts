@@ -1,6 +1,12 @@
 import express from 'express';
 import {randomUUID} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
+import {
+  matchesFilter,
+  normalizePath,
+  type Filter,
+  type VerificationFilter,
+} from '../shared/filter';
 
 const BUFFER_CAPACITY = 100;
 const WORKSPACE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
@@ -15,6 +21,29 @@ export type EventRow = {
 };
 
 type Cursor = {epoch: string; seq: number};
+
+/**
+ * Parse an observation scope from snapshot/stream query params.
+ * Absent params mean the unfiltered view (legacy behaviour). A present but
+ * malformed value is a client error, never a silent ignore.
+ */
+export function parseFilter(query: Record<string, unknown>): Filter | 'invalid' {
+  const filter: Filter = {};
+  const rawPath = query.path;
+  if (rawPath !== undefined) {
+    const path = normalizePath(String(rawPath));
+    if (path.length === 0 || path.length > 1024) return 'invalid';
+    filter.path = path;
+  }
+  const rawVerification = query.verification;
+  if (rawVerification !== undefined) {
+    const value = String(rawVerification);
+    if (value !== 'valid' && value !== 'invalid') return 'invalid';
+    filter.verification = value as VerificationFilter;
+  }
+  return filter;
+}
+
 
 export type GapPayload = {
   kind: 'gap';
@@ -46,14 +75,17 @@ class WorkspaceLog {
   private buffer: EventRow[] = [];
   private nextSeq = 1;
   private highWaterSeq = 0;
-  private listeners = new Set<express.Response>();
+  // Each listener owns its own observation scope; publish writes a frame only
+  // to listeners whose filter matches. Capture itself is unaffected — every
+  // event still lands in the shared buffer with its workspace-wide seq.
+  private listeners = new Set<{res: express.Response; filter: Filter}>();
   constructor(epoch: string, capacity: number) {
     this.epoch = epoch;
     this.capacity = capacity;
   }
 
-  snapshot() {
-    return this.buffer.slice();
+  snapshot(filter: Filter = {}) {
+    return this.buffer.filter(event => matchesFilter(event, filter));
   }
 
   get size() {
@@ -66,7 +98,9 @@ class WorkspaceLog {
     this.buffer.push(event);
     while (this.buffer.length > this.capacity) this.buffer.shift();
     const frame = this.eventFrame(event);
-    for (const listener of this.listeners) listener.write(frame);
+    for (const listener of this.listeners) {
+      if (matchesFilter(event, listener.filter)) listener.res.write(frame);
+    }
     return event;
   }
 
@@ -76,14 +110,20 @@ class WorkspaceLog {
   }
 
   /** Register the listener first, then flush replay frames, so nothing can slip in between. */
-  attach(res: express.Response, cursor: Cursor | null) {
-    this.listeners.add(res);
-    res.on('close', () => this.listeners.delete(res));
-    res.on('error', () => this.listeners.delete(res));
+  attach(res: express.Response, cursor: Cursor | null, filter: Filter = {}) {
+    const entry = {res, filter};
+    this.listeners.add(entry);
+    res.on('close', () => this.listeners.delete(entry));
+    res.on('error', () => this.listeners.delete(entry));
 
+    // Gap detection always reasons about the *whole* workspace buffer, whose
+    // seq numbers are the real record: skipped (non-matching) events are not a
+    // gap, while an evicted range that could have held a match genuinely is one.
     let gap: GapPayload | null = null;
     if (!cursor) {
-      for (const event of this.buffer) res.write(this.eventFrame(event));
+      for (const event of this.buffer) {
+        if (matchesFilter(event, filter)) res.write(this.eventFrame(event));
+      }
     } else if (cursor.epoch !== this.epoch) {
       gap = {
         kind: 'gap',
@@ -94,9 +134,11 @@ class WorkspaceLog {
         reason: 'epoch-changed',
         message: `服务端已重启（事件纪元 ${cursor.epoch} → ${this.epoch}），断线期间的事件无法补发。`,
       };
-      // Replay everything buffered in the new epoch; same seq numbers under a
-      // different epoch are different events and must all be delivered.
-      for (const event of this.buffer) res.write(this.eventFrame(event));
+      // Replay everything buffered in the new epoch (within scope); same seq
+      // numbers under a different epoch are different events.
+      for (const event of this.buffer) {
+        if (matchesFilter(event, filter)) res.write(this.eventFrame(event));
+      }
     } else if (this.buffer.length === 0) {
       // Nothing is buffered. Without a high-water mark nothing was ever lost;
       // if events past the cursor were published and evicted, that is a gap.
@@ -135,9 +177,11 @@ class WorkspaceLog {
           message: `Last-Event-ID #${cursor.seq} 领先于服务端缓冲（最新 #${newest}）。`,
         };
       }
-      // Replay only events strictly after the cursor; an overflow gap is still
-      // followed by the part of the buffer that survives.
-      for (const event of this.buffer) if (event.seq > cursor.seq) res.write(this.eventFrame(event));
+      // Replay only events strictly after the cursor that belong to this scope;
+      // an overflow gap is still followed by the surviving in-scope tail.
+      for (const event of this.buffer) {
+        if (event.seq > cursor.seq && matchesFilter(event, filter)) res.write(this.eventFrame(event));
+      }
     }
     if (gap) res.write(sseFrame(gap, {event: 'gap'}));
     res.write(sseFrame({epoch: this.epoch, capacity: this.capacity, buffered: this.buffer.length}, {event: 'ready'}));
@@ -195,7 +239,14 @@ export function createApp(options: {epoch?: string; bufferCapacity?: number} = {
       res.status(400).json({error: 'invalid workspace'});
       return;
     }
-    res.json({epoch, events: getWorkspace(name).snapshot()});
+    const filter = parseFilter(req.query as Record<string, unknown>);
+    if (filter === 'invalid') {
+      res.status(400).json({error: 'invalid filter'});
+      return;
+    }
+    // The filtered snapshot must be produced by the same condition the stream
+    // is opened with, so first paint and live push share one observation scope.
+    res.json({epoch, events: getWorkspace(name).snapshot(filter)});
   });
 
   app.post('/api/capture/:workspace/*path', (req, res) => {
@@ -210,6 +261,11 @@ export function createApp(options: {epoch?: string; bufferCapacity?: number} = {
   });
 
   app.get('/api/stream/:workspace', (req, res) => {
+    const filter = parseFilter(req.query as Record<string, unknown>);
+    if (filter === 'invalid') {
+      res.status(400).json({error: 'invalid filter'});
+      return;
+    }
     const log = getWorkspace(req.workspace!);
     const cursor = parseCursor(req.header('last-event-id'));
     res.set({
@@ -219,7 +275,7 @@ export function createApp(options: {epoch?: string; bufferCapacity?: number} = {
       'x-epoch': epoch,
     });
     res.flushHeaders?.();
-    log.attach(res, cursor);
+    log.attach(res, cursor, filter);
   });
 
   app.post('/api/replay', async (req, res) => {

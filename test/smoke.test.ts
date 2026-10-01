@@ -60,12 +60,12 @@ class SseClient {
   private req: http.ClientRequest;
   responseCode = 0;
 
-  constructor(base: string, workspace: string, lastEventId?: string) {
-    const url = new URL(`${base}/api/stream/${workspace}`);
+  constructor(base: string, workspace: string, lastEventId?: string, query?: string) {
+    const url = new URL(`${base}/api/stream/${workspace}${query ?? ''}`);
     const headers: Record<string, string> = {Accept: 'text/event-stream'};
     if (lastEventId !== undefined) headers['Last-Event-ID'] = lastEventId;
     this.req = http.request(
-      {host: url.hostname, port: url.port, path: url.pathname, headers},
+      {host: url.hostname, port: url.port, path: url.pathname + url.search, headers},
       res => {
       this.responseCode = res.statusCode ?? 0;
       res.setEncoding('utf8');
@@ -352,3 +352,161 @@ function clientEventsCount(frames: ParsedFrame[]) {
   // Server sends default events without an "event:" line (SSE spec: default = message).
   return frames.filter(frame => !frame.event).length;
 }
+
+async function fetchEvents(base: string, workspace: string, query = '') {
+  const payload = await (await fetch(`${base}/api/events?workspace=${workspace}${query}`)).json();
+  return payload.events as Array<Record<string, unknown>>;
+}
+
+function paths(events: Array<Record<string, unknown>>) {
+  return events.map(event => event.path as string);
+}
+
+describe('observation-scope filters', () => {
+  let server: ServerHandle;
+
+  beforeEach(async () => {
+    server = await startServer('test-epoch', 5);
+  });
+  afterEach(async () => {
+    await server.close();
+  });
+
+  it('snapshot and stream deliver only the requested path but capture keeps everything', async () => {
+    await postEvent(server.base, 'default', '/orders');
+    await postEvent(server.base, 'default', '/payments');
+
+    const filtered = await fetchEvents(server.base, 'default', '&path=/payments');
+    expect(seqs(filtered)).toEqual([2]);
+    expect(paths(filtered)).toEqual(['/payments']);
+
+    // Unfiltered snapshot still shows the workspace's true retained events.
+    expect(seqs(await fetchEvents(server.base, 'default'))).toEqual([1, 2]);
+
+    const client = new SseClient(server.base, 'default', undefined, '?path=/payments');
+    await client.waitFor(frames => frames.some(frame => frame.event === 'ready'));
+    expect(seqs(client.events())).toEqual([2]);
+
+    // Live: out-of-scope requests are never delivered, in-scope ones are.
+    await postEvent(server.base, 'default', '/orders'); // seq 3, skipped
+    await postEvent(server.base, 'default', '/payments'); // seq 4
+    await client.waitFor(frames => client.events().length >= 2);
+    expect(seqs(client.events())).toEqual([2, 4]);
+    client.close();
+
+    // Capture never stopped: the unfiltered view keeps the real record.
+    expect(seqs(await fetchEvents(server.base, 'default'))).toEqual([1, 2, 3, 4]);
+  });
+
+  it('matches paths regardless of a leading slash and filters by verification', async () => {
+    await postEvent(server.base, 'default', '/orders', 'sig'); // valid
+    await postEvent(server.base, 'default', '/orders', ''); // invalid
+    expect(seqs(await fetchEvents(server.base, 'default', '&path=orders'))).toEqual([1, 2]);
+    expect(seqs(await fetchEvents(server.base, 'default', '&path=orders&verification=invalid'))).toEqual([2]);
+    expect(seqs(await fetchEvents(server.base, 'default', '&verification=valid'))).toEqual([1]);
+  });
+
+  it('does not treat skipped out-of-scope events as a gap on resume', async () => {
+    await postEvent(server.base, 'default', '/payments'); // seq 1, last in-scope seen
+    const before = new SseClient(server.base, 'default', undefined, '?path=/payments');
+    await before.waitFor(frames => clientEventsCount(frames) >= 1);
+    before.close();
+
+    // While disconnected, only out-of-scope traffic arrives. Buffer holds 1..4
+    // (capacity 5), so nothing is unrecoverable even though no match follows.
+    await postEvent(server.base, 'default', '/orders'); // 2
+    await postEvent(server.base, 'default', '/orders'); // 3
+    const after = new SseClient(server.base, 'default', 'test-epoch:1', '?path=/payments');
+    await after.waitFor(frames => frames.some(frame => frame.event === 'ready'));
+    expect(after.events()).toHaveLength(0);
+    expect(after.gaps()).toHaveLength(0);
+
+    await postEvent(server.base, 'default', '/payments'); // 4
+    await after.waitFor(frames => clientEventsCount(frames) >= 1);
+    expect(seqs(after.events())).toEqual([4]);
+    after.close();
+  });
+
+  it('still reports a real overflow gap when the evicted range could have matched', async () => {
+    // Cursor at 1; buffer (capacity 5) rolls to 3..7, so seq 2 is gone and that
+    // gap is reported even though the filter currently happens to match nothing.
+    for (let seq = 1; seq <= 7; seq++) await postEvent(server.base, 'default', '/orders');
+    const client = new SseClient(server.base, 'default', 'test-epoch:1', '?path=/payments');
+    await client.waitFor(frames => frames.some(frame => frame.event === 'gap'));
+    const gap = client.gaps()[0];
+    expect(gap.reason).toBe('buffer-overflow');
+    expect(gap.lastSeen).toBe(1);
+    expect(gap.oldest).toBe(3);
+    client.close();
+  });
+
+  it('resumes an in-scope connection strictly after its own cursor', async () => {
+    await postEvent(server.base, 'default', '/payments'); // 1
+    await postEvent(server.base, 'default', '/orders'); // 2
+    await postEvent(server.base, 'default', '/payments'); // 3
+    const client = new SseClient(server.base, 'default', 'test-epoch:1', '?path=/payments');
+    await client.waitFor(frames => frames.some(frame => frame.event === 'ready'));
+    expect(seqs(client.events())).toEqual([3]);
+    expect(client.gaps()).toHaveLength(0);
+    client.close();
+  });
+
+  it('keeps two scopes of one workspace on independent live streams', async () => {
+    const all = new SseClient(server.base, 'default');
+    const payments = new SseClient(server.base, 'default', undefined, '?path=/payments');
+    await Promise.all([
+      all.waitFor(frames => frames.some(frame => frame.event === 'ready')),
+      payments.waitFor(frames => frames.some(frame => frame.event === 'ready')),
+    ]);
+    await postEvent(server.base, 'default', '/orders');
+    await postEvent(server.base, 'default', '/payments');
+    await Promise.all([
+      all.waitFor(frames => clientEventsCount(frames) >= 2),
+      payments.waitFor(frames => clientEventsCount(frames) >= 1),
+    ]);
+    expect(seqs(all.events())).toEqual([1, 2]);
+    expect(seqs(payments.events())).toEqual([2]);
+    all.close();
+    payments.close();
+  });
+
+  it('rejects malformed filter values on snapshot and stream', async () => {
+    const snapshot = await fetch(
+      `${server.base}/api/events?workspace=default&verification=maybe`,
+    );
+    expect(snapshot.status).toBe(400);
+    const streamed = await new Promise<number>(resolve => {
+      const req = http.get(
+        `${server.base}/api/stream/default?verification=maybe`,
+        res => resolve(res.statusCode ?? 0),
+      );
+      req.on('error', () => resolve(0));
+    });
+    expect(streamed).toBe(400);
+  });
+
+  it('reports epoch restarts inside a filtered scope', async () => {
+    const oldServer = await startServer('epoch-A', 5);
+    try {
+      await postEvent(oldServer.base, 'default', '/payments');
+      const client = new SseClient(oldServer.base, 'default', 'epoch-A:1', '?path=/payments');
+      await client.waitFor(frames => frames.some(frame => frame.event === 'ready'));
+      client.close();
+    } finally {
+      await oldServer.close();
+    }
+
+    const newServer = await startServer('epoch-B', 5);
+    try {
+      await postEvent(newServer.base, 'default', '/orders'); // seq 1, out of scope
+      await postEvent(newServer.base, 'default', '/payments'); // seq 2, in scope
+      const client = new SseClient(newServer.base, 'default', 'epoch-A:1', '?path=/payments');
+      await client.waitFor(frames => frames.some(frame => frame.event === 'gap'));
+      expect(client.gaps()[0].reason).toBe('epoch-changed');
+      expect(seqs(client.events())).toEqual([2]);
+      client.close();
+    } finally {
+      await newServer.close();
+    }
+  });
+});
